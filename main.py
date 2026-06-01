@@ -89,7 +89,7 @@ LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
-CURRENT_VERSION = "1.1.6"
+CURRENT_VERSION = "1.1.6.2"
 def auto_extract_configs():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     
@@ -1317,6 +1317,113 @@ class FH_UltimateBot(ctk.CTk):
             except Exception:
                 pass
         self.ui_call(write_ui)
+
+    def _region_display_name(self, region):
+        if region is None:
+            return "全屏"
+        for name, rect in self.regions.items():
+            if region == rect:
+                return name
+        return "自定义区域"
+
+    def probe_gray_templates(self, image_list, region=None, fast_mode=True):
+        """扫描模板在当前区域的最高灰度匹配分（用于失败诊断）。"""
+        results = []
+        if not self.is_running:
+            return results
+        try:
+            screen_bgr = self.capture_region(region)
+            screen_gray = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
+            scales_to_try = self.get_scales_to_try(fast_mode=fast_mode)
+            for img_path in image_list:
+                best_score = 0.0
+                best_scale = 0.0
+                missing = False
+                for scale in scales_to_try:
+                    tpl_gray = self.load_template_gray(img_path)
+                    if tpl_gray is None:
+                        missing = True
+                        break
+                    if scale != 1.0:
+                        tpl_gray = cv2.resize(
+                            tpl_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+                        )
+                    h, w = tpl_gray.shape[:2]
+                    if h < 5 or w < 5 or h > screen_gray.shape[0] or w > screen_gray.shape[1]:
+                        continue
+                    res = cv2.matchTemplate(screen_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+                    max_val = cv2.minMaxLoc(res)[1]
+                    if max_val > best_score:
+                        best_score = max_val
+                        best_scale = scale
+                results.append(
+                    {"path": img_path, "score": best_score, "scale": best_scale, "missing": missing}
+                )
+        except Exception as e:
+            self.log(f"probe_gray_templates 异常: {e}")
+        return results
+
+    def log_image_detection_failure(
+        self, step, image_list, region=None, threshold=0.75, fast_mode=True, extra=""
+    ):
+        """识图未命中时记录步骤、区域、阈值与各模板最高分。"""
+        primary = self._region_display_name(region)
+        self.log(
+            f"[识图失败] {step} | 主区域={primary} | 阈值={threshold} | 模板={', '.join(image_list)}"
+        )
+        if extra:
+            self.log(f"[识图失败] 上下文: {extra}")
+        for p in self.probe_gray_templates(image_list, region=region, fast_mode=fast_mode):
+            if p.get("missing"):
+                self.log(f"[识图失败] 模板文件缺失: {p['path']}")
+            else:
+                self.log(
+                    f"[识图失败] {p['path']} @「{primary}」"
+                    f" 最高分={p['score']:.3f} 缩放={p['scale']:.3f} (未达阈值)"
+                )
+        full_region = self.regions.get("全界面")
+        if full_region is not None and region != full_region:
+            for p in self.probe_gray_templates(image_list, region=full_region, fast_mode=fast_mode):
+                if not p.get("missing"):
+                    self.log(
+                        f"[识图失败] {p['path']} @「全界面」"
+                        f" 最高分={p['score']:.3f} 缩放={p['scale']:.3f}"
+                    )
+
+    def _try_enter_cj_mastery_menu(self):
+        """进入「车辆熟练度」；含方向键导航与全界面兜底。"""
+        templates = ["clsldcnw.png", "clsldcnb.png"]
+        threshold = 0.68
+        search_plan = [
+            ("左下", self.regions["左下"], 8),
+            ("全界面", self.regions["全界面"], 5),
+        ]
+        for nav_try in range(4):
+            if nav_try > 0:
+                self.log(f"车辆熟练度：导航重试 {nav_try}/3（按 down）")
+                self.hw_press("down", delay=0.12)
+                time.sleep(0.35)
+            for reg_name, reg, timeout_sec in search_plan:
+                pos = self.wait_for_any_image_gray(
+                    templates,
+                    region=reg,
+                    threshold=threshold,
+                    timeout=timeout_sec,
+                    interval=0.25,
+                    fast_mode=True,
+                )
+                if pos:
+                    self.log(f"车辆熟练度：在「{reg_name}」识别成功")
+                    return pos
+        self.log_image_detection_failure(
+            "车辆熟练度入口",
+            templates,
+            region=self.regions["左下"],
+            threshold=threshold,
+            extra="已点击升级与调教；已尝试 down 导航 + 全界面兜底",
+        )
+        return None
+
     def start_pipeline(self, start_step):
         if self.is_running:
             return
@@ -3598,6 +3705,8 @@ class FH_UltimateBot(ctk.CTk):
         self.log("进入车辆界面...")
         time.sleep(0.5)
 
+        cj_flow_fail_streak = 0
+
         while self.cj_counter < target_count:
             if not self.is_running:
                 return False
@@ -3627,7 +3736,13 @@ class FH_UltimateBot(ctk.CTk):
                 time.sleep(0.25)
 
             if not brand_pos:
-                self.log("选品牌失败")
+                self.log_image_detection_failure(
+                    "选择斯巴鲁品牌",
+                    ["CCbrand.png"],
+                    region=self.regions["全界面"],
+                    threshold=0.75,
+                    extra="已按 up 搜索 30 次",
+                )
                 return False
 
             self.game_click(brand_pos)
@@ -3642,9 +3757,9 @@ class FH_UltimateBot(ctk.CTk):
                         self.hw_press("right", delay=0.06)
                         time.sleep(0.1)
                     time.sleep(0.15) # 给一点点动画缓冲时间
-            pos_target = None
             found_car = False
             current_page = jump_pages # 记录当前所在的真实页码
+            pages_scanned = 0
             
             # 最大翻页次数扣除已经跳过的页数
             for _ in range(85 - jump_pages):
@@ -3676,56 +3791,105 @@ class FH_UltimateBot(ctk.CTk):
                     time.sleep(0.1)
                 time.sleep(0.4)
                 current_page += 1
+                pages_scanned += 1
             if not found_car:
-                self.log("列表中未找到目标车辆，重置记忆页码。")
-                self.memory_car_page = 0 # 没找到说明车刷完了，清零记忆
-                return False
+                self.log(
+                    f"列表中未找到目标车辆（已扫描约 {pages_scanned} 页，"
+                    f"记忆页码 {self.memory_car_page}→0）。视为无可购目标车，正常结束超级抽奖。"
+                )
+                self.log_image_detection_failure(
+                    "列表扫描-目标车辆(newCC+全新标签)",
+                    ["newCC.png", "newcartag.png"],
+                    region=self.regions["全界面"],
+                    threshold=0.70,
+                    extra=f"翻页起点={jump_pages}，最终页码={current_page}",
+                )
+                self.memory_car_page = 0
+                return True
             time.sleep(1.2)
             self.log("尝试寻找'上车'按钮...")
 
             pos_rc = None
             pos_rc = self.wait_for_image_gray("rc.png", region=self.regions["全界面"], threshold=0.70, timeout=0.5, interval=0.1, fast_mode=True)
             
+            boarded_via_rc = False
             if pos_rc:
                 self.log("点击上车")
                 self.game_click(pos_rc)
+                boarded_via_rc = True
                 time.sleep(2.0)  # 点击后等待上车加载
             else:
-                self.log("回车上车")
+                self.log("回车上车（未识别 rc.png，使用双 Enter 兜底）")
+                self.log_image_detection_failure(
+                    "上车按钮 rc.png",
+                    ["rc.png"],
+                    region=self.regions["全界面"],
+                    threshold=0.70,
+                    extra="将使用 Enter 兜底，可能影响后续菜单层级",
+                )
                 self.hw_press("enter")
                 time.sleep(1.0)
                 self.hw_press("enter")
                 time.sleep(1.0)
 
-
+            ut_templates = ["UandT-w.png", "UandT-b.png"]
+            ut_threshold = 0.70
             pos_sjy = None
-            for _ in range(20):
+            for esc_try in range(20):
                 if not self.is_running:
                     return False
 
-                pos_sjy = self.find_any_image_gray(["UandT-w.png", "UandT-b.png"], region=self.regions["左下"], threshold=0.70)
+                pos_sjy = self.find_any_image_gray(
+                    ut_templates, region=self.regions["左下"], threshold=ut_threshold
+                )
                 if pos_sjy:
+                    break
+                pos_sjy = self.find_any_image_gray(
+                    ut_templates, region=self.regions["全界面"], threshold=ut_threshold
+                )
+                if pos_sjy:
+                    self.log("升级与调教：在「全界面」兜底识别成功")
                     break
 
                 self.hw_press("esc")
                 time.sleep(0.5)
 
             if not pos_sjy:
-                self.log("找不到升级页面")
-                return False
+                self.log_image_detection_failure(
+                    "升级与调教入口",
+                    ut_templates,
+                    region=self.regions["左下"],
+                    threshold=ut_threshold,
+                    extra=f"已 ESC 重试 20 次；上车方式={'rc点击' if boarded_via_rc else '双Enter'}",
+                )
+                cj_flow_fail_streak += 1
+                if cj_flow_fail_streak >= 3:
+                    self.log(
+                        "超级抽奖：连续 3 次无法进入升级与调教，结束本模块（避免无意义全局恢复）。"
+                    )
+                    return True
+                for _ in range(3):
+                    self.hw_press("esc")
+                    time.sleep(0.8)
+                continue
 
             self.game_click(pos_sjy)
-            time.sleep(0.5)
+            time.sleep(1.2)
 
-            pos_cls = self.wait_for_any_image_gray(
-                ["clsldcnw.png", "clsldcnb.png"],
-                region=self.regions["左下"],
-                threshold=0.70,
-                timeout=20
-            )
+            pos_cls = self._try_enter_cj_mastery_menu()
             if not pos_cls:
-                self.log("未找到车辆熟练度")
-                return False
+                cj_flow_fail_streak += 1
+                if cj_flow_fail_streak >= 3:
+                    self.log(
+                        "超级抽奖：连续 3 次无法进入车辆熟练度，结束本模块（避免无意义全局恢复）。"
+                    )
+                    return True
+                for _ in range(3):
+                    self.hw_press("esc")
+                    time.sleep(0.8)
+                continue
+
+            cj_flow_fail_streak = 0
             self.game_click(pos_cls)
             time.sleep(1.5)
 
