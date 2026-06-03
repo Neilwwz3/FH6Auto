@@ -89,7 +89,7 @@ LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
-CURRENT_VERSION = "1.1.6.2"
+CURRENT_VERSION = "1.1.6.3"
 def auto_extract_configs():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     
@@ -1389,6 +1389,194 @@ class FH_UltimateBot(ctk.CTk):
                         f"[识图失败] {p['path']} @「全界面」"
                         f" 最高分={p['score']:.3f} 缩放={p['scale']:.3f}"
                     )
+
+    # --- 超级抽奖：页面定义（优先级高的先匹配 = 更具体的子界面）---
+    CJ_PAGE_DEFS = [
+        {"id": "MASTERY_SKILL", "label": "熟练度加点页", "templates": ["EXPwU.png"], "region_key": "左", "threshold": 0.75},
+        {"id": "MASTERY_MENU", "label": "升级菜单(含熟练度项)", "templates": ["clsldcnw.png", "clsldcnb.png"], "region_key": "左下", "threshold": 0.68},
+        {"id": "UPGRADE_TUNING", "label": "车辆详情-升级与调教", "templates": ["UandT-w.png", "UandT-b.png"], "region_key": "左下", "threshold": 0.70},
+        {"id": "CAR_DETAIL", "label": "车辆详情", "templates": ["rc.png"], "region_key": "全界面", "threshold": 0.62},
+        {"id": "MY_CARS_LIST", "label": "我的车辆-品牌列表", "templates": ["CCbrand.png"], "region_key": "全界面", "threshold": 0.75},
+        {"id": "BUY_SELL", "label": "购买与出售", "templates": ["buyandsell-w.png", "buyandsell-b.png"], "region_key": "左", "threshold": 0.75},
+        {"id": "MENU_ESC", "label": "主菜单ESC页", "templates": ["collectionjournal.png"], "region_key": "左", "threshold": 0.70},
+    ]
+
+    def _cj_page_label(self, page_id):
+        for p in self.CJ_PAGE_DEFS:
+            if p["id"] == page_id:
+                return p["label"]
+        return page_id or "未知"
+
+    def detect_current_page_cj(self, log_scores=False):
+        """根据锚点模板判断超级抽奖相关界面；返回 (page_id, best_score, all_scores)。"""
+        all_scores = {}
+        best_id = "UNKNOWN"
+        best_score = 0.0
+
+        for page_def in self.CJ_PAGE_DEFS:
+            region = self.regions.get(page_def["region_key"], self.regions["全界面"])
+            probes = self.probe_gray_templates(
+                page_def["templates"], region=region, fast_mode=True
+            )
+            page_best = 0.0
+            for p in probes:
+                if not p.get("missing"):
+                    page_best = max(page_best, p["score"])
+            all_scores[page_def["id"]] = {
+                "score": page_best,
+                "threshold": page_def["threshold"],
+                "label": page_def["label"],
+                "probes": probes,
+            }
+            if page_best >= page_def["threshold"] and page_best > best_score:
+                best_score = page_best
+                best_id = page_def["id"]
+
+        if log_scores:
+            parts = [f"{k}:{v['score']:.2f}" for k, v in all_scores.items()]
+            self.log(f"[页面识别] 当前={best_id}({best_score:.2f}) | " + " ".join(parts))
+
+        return best_id, best_score, all_scores
+
+    def _cj_enter_my_cars_brand_list(self):
+        """从「购买与出售」进入「我的车辆」品牌列表（CCbrand）。"""
+        self.log("进入我的车辆.")
+        self.hw_press("enter")
+        time.sleep(2.0)
+        self.hw_press("backspace")
+        time.sleep(1.0)
+
+    def _cj_nav_step_toward(self, current_id, target_id):
+        """单步：根据当前页向目标页靠近一步。返回是否已到达目标。"""
+        if current_id == target_id:
+            return True
+
+        if target_id == "MY_CARS_LIST":
+            if current_id == "BUY_SELL":
+                self._cj_enter_my_cars_brand_list()
+                return False
+            if current_id in ("CAR_DETAIL", "UPGRADE_TUNING", "MASTERY_MENU", "MASTERY_SKILL"):
+                self.log(f"[页面导航] {self._cj_page_label(current_id)} → 按 ESC 退回")
+                self.hw_press("esc")
+                time.sleep(0.7)
+                return False
+            if current_id == "MENU_ESC":
+                self.log("[页面导航] 已在主菜单，需重新进入购买与出售流程")
+                return False
+            self.hw_press("esc")
+            time.sleep(0.6)
+            return False
+
+        if target_id == "BUY_SELL":
+            if current_id in ("CAR_DETAIL", "UPGRADE_TUNING", "MASTERY_MENU", "MASTERY_SKILL", "MY_CARS_LIST"):
+                self.hw_press("esc")
+                time.sleep(0.7)
+                return False
+            if current_id == "MENU_ESC":
+                return False
+            self.hw_press("esc")
+            time.sleep(0.6)
+            return False
+
+        if target_id == "MENU_ESC":
+            if self.is_in_menu():
+                return True
+            self.hw_press("esc")
+            time.sleep(0.8)
+            return False
+
+        return False
+
+    def navigate_to_cj_page(self, target_id, max_steps=14):
+        """识图驱动：从当前界面逐步导航到目标页面。"""
+        target_label = self._cj_page_label(target_id)
+        for step in range(max_steps):
+            if not self.is_running:
+                return False
+
+            current_id, score, _ = self.detect_current_page_cj(log_scores=(step == 0))
+            if current_id == target_id:
+                self.log(f"[页面导航] 已到达目标：{target_label} ({target_id})")
+                return True
+
+            self.log(
+                f"[页面导航] 步骤 {step + 1}/{max_steps}："
+                f"当前={self._cj_page_label(current_id)}({score:.2f}) → 目标={target_label}"
+            )
+            if self._cj_nav_step_toward(current_id, target_id):
+                return True
+
+            time.sleep(0.35)
+
+        current_id, score, all_scores = self.detect_current_page_cj(log_scores=True)
+        self.log(
+            f"[页面导航] 超时未到达 {target_label}，仍停留在 {self._cj_page_label(current_id)}({score:.2f})"
+        )
+        return False
+
+    def cj_recover_to_checkpoint(self, checkpoint_id="MY_CARS_LIST", max_rounds=2):
+        """模块内恢复：回到抽奖循环检查点；失败则建议结束模块（避免全局恢复死循环）。"""
+        label = self._cj_page_label(checkpoint_id)
+        for attempt in range(1, max_rounds + 1):
+            self.log(f"[页面恢复] 第 {attempt}/{max_rounds} 轮：尝试回到 {label}")
+            if self.navigate_to_cj_page(checkpoint_id, max_steps=14):
+                cid, cscore, _ = self.detect_current_page_cj()
+                if cid == checkpoint_id:
+                    return True
+            time.sleep(0.5)
+
+        cid, cscore, _ = self.detect_current_page_cj(log_scores=True)
+        self.log(f"[页面恢复] 无法回到 {label}，当前={self._cj_page_label(cid)}({cscore:.2f})")
+        return False
+
+    def _cj_find_upgrade_tuning_entry(self, boarded_via_rc):
+        """在车辆详情上下文寻找并点击「升级与调教」。"""
+        ut_templates = ["UandT-w.png", "UandT-b.png"]
+        ut_threshold = 0.70
+
+        page_id, _, _ = self.detect_current_page_cj()
+        if page_id in ("MASTERY_MENU", "MASTERY_SKILL"):
+            self.log("[页面] 已在升级/熟练度深层，先尝试退回车辆详情")
+            for _ in range(3):
+                self.hw_press("esc")
+                time.sleep(0.6)
+                page_id, _, _ = self.detect_current_page_cj()
+                if page_id in ("CAR_DETAIL", "UPGRADE_TUNING", "BUY_SELL", "MY_CARS_LIST"):
+                    break
+
+        for attempt in range(8):
+            if not self.is_running:
+                return None
+
+            pos_sjy = self.find_any_image_gray(
+                ut_templates, region=self.regions["左下"], threshold=ut_threshold
+            )
+            if not pos_sjy:
+                pos_sjy = self.find_any_image_gray(
+                    ut_templates, region=self.regions["全界面"], threshold=ut_threshold
+                )
+            if pos_sjy:
+                if attempt > 0:
+                    self.log(f"升级与调教：第 {attempt + 1} 次尝试命中")
+                return pos_sjy
+
+            cur, score, _ = self.detect_current_page_cj()
+            self.log(f"[页面] 未找到升级与调教，当前={self._cj_page_label(cur)}({score:.2f})")
+            if cur == "MY_CARS_LIST" or cur == "BUY_SELL":
+                break
+            if cur == "MENU_ESC":
+                break
+            self.hw_press("esc")
+            time.sleep(0.5)
+
+        self.log_image_detection_failure(
+            "升级与调教入口",
+            ut_templates,
+            region=self.regions["左下"],
+            threshold=ut_threshold,
+            extra=f"上车方式={'rc点击' if boarded_via_rc else '双Enter'}",
+        )
+        return None
 
     def _try_enter_cj_mastery_menu(self):
         """进入「车辆熟练度」；含方向键导航与全界面兜底。"""
@@ -3705,16 +3893,29 @@ class FH_UltimateBot(ctk.CTk):
         self.log("进入车辆界面...")
         time.sleep(0.5)
 
-        cj_flow_fail_streak = 0
+        page_id, _, _ = self.detect_current_page_cj(log_scores=True)
+        if page_id != "MY_CARS_LIST":
+            self.navigate_to_cj_page("MY_CARS_LIST", max_steps=10)
 
         while self.cj_counter < target_count:
             if not self.is_running:
                 return False
-            self.log("进入我的车辆.")
-            self.hw_press("enter")
-            time.sleep(2.0)
-            self.hw_press("backspace")
-            time.sleep(1.0)
+
+            cur_page, cur_score, _ = self.detect_current_page_cj()
+            if cur_page == "MY_CARS_LIST":
+                pass
+            elif cur_page == "BUY_SELL":
+                self._cj_enter_my_cars_brand_list()
+            else:
+                self.log(
+                    f"[页面] 循环起点不在品牌列表（当前={self._cj_page_label(cur_page)} {cur_score:.2f}），尝试恢复"
+                )
+                if not self.cj_recover_to_checkpoint("MY_CARS_LIST"):
+                    self.log("超级抽奖：无法回到品牌列表检查点，正常结束本模块。")
+                    return True
+                cur_page, _, _ = self.detect_current_page_cj()
+                if cur_page == "BUY_SELL":
+                    self._cj_enter_my_cars_brand_list()
 
             brand_pos = None
             for _ in range(30):
@@ -3736,14 +3937,18 @@ class FH_UltimateBot(ctk.CTk):
                 time.sleep(0.25)
 
             if not brand_pos:
+                cur_page, cur_score, _ = self.detect_current_page_cj(log_scores=True)
                 self.log_image_detection_failure(
                     "选择斯巴鲁品牌",
                     ["CCbrand.png"],
                     region=self.regions["全界面"],
                     threshold=0.75,
-                    extra="已按 up 搜索 30 次",
+                    extra=f"当前页面={self._cj_page_label(cur_page)}({cur_score:.2f})",
                 )
-                return False
+                if not self.cj_recover_to_checkpoint("MY_CARS_LIST"):
+                    self.log("超级抽奖：选品牌失败且无法恢复，正常结束本模块。")
+                    return True
+                continue
 
             self.game_click(brand_pos)
             time.sleep(1.0)
@@ -3809,87 +4014,48 @@ class FH_UltimateBot(ctk.CTk):
             time.sleep(1.2)
             self.log("尝试寻找'上车'按钮...")
 
-            pos_rc = None
-            pos_rc = self.wait_for_image_gray("rc.png", region=self.regions["全界面"], threshold=0.70, timeout=0.5, interval=0.1, fast_mode=True)
-            
+            pos_rc = self.wait_for_image_gray(
+                "rc.png", region=self.regions["全界面"], threshold=0.62, timeout=1.0, interval=0.15, fast_mode=True
+            )
             boarded_via_rc = False
             if pos_rc:
                 self.log("点击上车")
                 self.game_click(pos_rc)
                 boarded_via_rc = True
-                time.sleep(2.0)  # 点击后等待上车加载
+                time.sleep(2.0)
             else:
                 self.log("回车上车（未识别 rc.png，使用双 Enter 兜底）")
                 self.log_image_detection_failure(
                     "上车按钮 rc.png",
                     ["rc.png"],
                     region=self.regions["全界面"],
-                    threshold=0.70,
-                    extra="将使用 Enter 兜底，可能影响后续菜单层级",
+                    threshold=0.62,
+                    extra="将使用 Enter 兜底；后续由页面识别纠正",
                 )
                 self.hw_press("enter")
                 time.sleep(1.0)
                 self.hw_press("enter")
                 time.sleep(1.0)
 
-            ut_templates = ["UandT-w.png", "UandT-b.png"]
-            ut_threshold = 0.70
-            pos_sjy = None
-            for esc_try in range(20):
-                if not self.is_running:
-                    return False
-
-                pos_sjy = self.find_any_image_gray(
-                    ut_templates, region=self.regions["左下"], threshold=ut_threshold
-                )
-                if pos_sjy:
-                    break
-                pos_sjy = self.find_any_image_gray(
-                    ut_templates, region=self.regions["全界面"], threshold=ut_threshold
-                )
-                if pos_sjy:
-                    self.log("升级与调教：在「全界面」兜底识别成功")
-                    break
-
-                self.hw_press("esc")
-                time.sleep(0.5)
-
+            self.detect_current_page_cj(log_scores=True)
+            pos_sjy = self._cj_find_upgrade_tuning_entry(boarded_via_rc)
             if not pos_sjy:
-                self.log_image_detection_failure(
-                    "升级与调教入口",
-                    ut_templates,
-                    region=self.regions["左下"],
-                    threshold=ut_threshold,
-                    extra=f"已 ESC 重试 20 次；上车方式={'rc点击' if boarded_via_rc else '双Enter'}",
-                )
-                cj_flow_fail_streak += 1
-                if cj_flow_fail_streak >= 3:
-                    self.log(
-                        "超级抽奖：连续 3 次无法进入升级与调教，结束本模块（避免无意义全局恢复）。"
-                    )
+                if not self.cj_recover_to_checkpoint("MY_CARS_LIST"):
+                    self.log("超级抽奖：无法进入升级与调教且无法回到列表，正常结束本模块。")
                     return True
-                for _ in range(3):
-                    self.hw_press("esc")
-                    time.sleep(0.8)
                 continue
 
             self.game_click(pos_sjy)
             time.sleep(1.2)
+            self.detect_current_page_cj(log_scores=True)
 
             pos_cls = self._try_enter_cj_mastery_menu()
             if not pos_cls:
-                cj_flow_fail_streak += 1
-                if cj_flow_fail_streak >= 3:
-                    self.log(
-                        "超级抽奖：连续 3 次无法进入车辆熟练度，结束本模块（避免无意义全局恢复）。"
-                    )
+                if not self.cj_recover_to_checkpoint("MY_CARS_LIST"):
+                    self.log("超级抽奖：无法进入车辆熟练度且无法回到列表，正常结束本模块。")
                     return True
-                for _ in range(3):
-                    self.hw_press("esc")
-                    time.sleep(0.8)
                 continue
 
-            cj_flow_fail_streak = 0
             self.game_click(pos_cls)
             time.sleep(1.5)
 
@@ -3934,12 +4100,14 @@ class FH_UltimateBot(ctk.CTk):
                 self.cj_counter += 1
                 self.update_running_ui("超级抽奖", self.cj_counter, target_count)
 
-            self.hw_press("esc")
-            time.sleep(1.2)
-            self.hw_press("esc")
-            time.sleep(0.8)
-            self.hw_press("up", delay=0.15)
-            time.sleep(0.8)
+            self.log("[页面] 本轮完成，尝试回到品牌列表检查点...")
+            if not self.cj_recover_to_checkpoint("MY_CARS_LIST", max_rounds=1):
+                self.hw_press("esc")
+                time.sleep(0.8)
+                self.hw_press("esc")
+                time.sleep(0.8)
+                self.hw_press("up", delay=0.15)
+                time.sleep(0.8)
         self.hw_press("esc")
         time.sleep(1.2)
         self.hw_press("esc")
