@@ -89,7 +89,7 @@ LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
-CURRENT_VERSION = "1.1.6.6"
+CURRENT_VERSION = "1.1.6.7"
 def auto_extract_configs():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     
@@ -1400,9 +1400,15 @@ class FH_UltimateBot(ctk.CTk):
         {"id": "MY_CARS_LIST", "label": "我的车辆-品牌列表", "templates": ["CCbrand.png"], "region_key": "全界面", "threshold": 0.75},
         {"id": "MENU_ESC", "label": "主菜单ESC页", "templates": ["collectionjournal.png"], "region_key": "左", "threshold": 0.70},
     ]
-    # 嘉年华页签：用内容区/侧栏独特模板，不用 buyandsell-w/b（仅颜色差异易误判）
-    CJ_BUYSELL_HUB_TEMPLATE = "buysell_hub.png"  # 车展/拍卖场等，仅「购买与出售」页
-    CJ_BUYSELL_HUB_THRESHOLD = 0.72
+    # 嘉年华「购买与出售」页：四枚小图命中 ≥2 即确认（车展/通行证/票券车辆/车辆包）
+    CJ_BUYSELL_HUB_TEMPLATES = (
+        "buysell_autoshow.png",
+        "buysell_carpass.png",
+        "buysell_vouchercar.png",
+        "buysell_carpack.png",
+    )
+    CJ_BUYSELL_HUB_ITEM_THRESHOLD = 0.72
+    CJ_BUYSELL_HUB_MIN_HITS = 2
     CJ_VEHICLE_TAB_TEMPLATE = "UandT-w.png"  # 嘉年华左侧「车辆」标签（未选中态）
     CJ_VEHICLE_TAB_THRESHOLD = 0.70
     CJ_CARNIVAL_PROBE_REGION_KEYS = ("全界面", "左")
@@ -1437,10 +1443,35 @@ class FH_UltimateBot(ctk.CTk):
                     best = max(best, p["score"])
         return best
 
-    def _cj_probe_buysell_hub_score(self):
-        return self._cj_probe_templates_in_regions(
-            [self.CJ_BUYSELL_HUB_TEMPLATE], self.CJ_CARNIVAL_PROBE_REGION_KEYS
-        )
+    def _cj_probe_buysell_hub_hits(self):
+        """
+        逐枚探测购买与出售页特征图。
+        返回 (命中数, {模板: 最高分}, 代表分=命中项均分，无命中时取全局最高)。
+        """
+        per_scores = {}
+        hit_scores = []
+        for tmpl in self.CJ_BUYSELL_HUB_TEMPLATES:
+            score = self._cj_probe_templates_in_regions(
+                [tmpl], self.CJ_CARNIVAL_PROBE_REGION_KEYS
+            )
+            per_scores[tmpl] = score
+            if score >= self.CJ_BUYSELL_HUB_ITEM_THRESHOLD:
+                hit_scores.append(score)
+        hits = len(hit_scores)
+        if hit_scores:
+            rep = sum(hit_scores) / len(hit_scores)
+        else:
+            rep = max(per_scores.values()) if per_scores else 0.0
+        return hits, per_scores, rep
+
+    def _cj_format_buysell_hub_scores(self, per_scores):
+        short = {
+            "车展": per_scores.get("buysell_autoshow.png", 0.0),
+            "通行证": per_scores.get("buysell_carpass.png", 0.0),
+            "票券车": per_scores.get("buysell_vouchercar.png", 0.0),
+            "车辆包": per_scores.get("buysell_carpack.png", 0.0),
+        }
+        return " ".join(f"{k}={v:.2f}" for k, v in short.items())
 
     def _cj_probe_vehicle_tab_score(self):
         """UandT-w 只在左侧标签栏匹配，避免与车内左下「升级与调教」混淆。"""
@@ -1449,9 +1480,10 @@ class FH_UltimateBot(ctk.CTk):
         )
 
     def _cj_is_buy_sell_hub_confirmed(self):
-        """确认在购买与出售页（buysell_hub 内容区）。返回 (confirmed, score)。"""
-        score = self._cj_probe_buysell_hub_score()
-        return score >= self.CJ_BUYSELL_HUB_THRESHOLD, score
+        """四特征图命中 ≥2 视为购买与出售页。返回 (confirmed, rep_score, hits, per_scores)。"""
+        hits, per_scores, rep = self._cj_probe_buysell_hub_hits()
+        ok = hits >= self.CJ_BUYSELL_HUB_MIN_HITS
+        return ok, rep, hits, per_scores
 
     def _cj_is_vehicle_tab_confirmed(self):
         """确认在嘉年华「车辆」标签。返回 (confirmed, score)。"""
@@ -1459,15 +1491,18 @@ class FH_UltimateBot(ctk.CTk):
         return score >= self.CJ_VEHICLE_TAB_THRESHOLD, score
 
     def _cj_ensure_buy_sell_hub(self, max_pagedown=24):
-        """嘉年华/住所：PageDown 直到 buysell_hub（车展/拍卖场等）出现。"""
-        self.log("确认进入购买与出售页（识图 buysell_hub）...")
+        """嘉年华/住所：PageDown 直到购买与出售四特征图命中 ≥2。"""
+        self.log(
+            f"确认进入购买与出售页（{len(self.CJ_BUYSELL_HUB_TEMPLATES)} 图命中"
+            f"≥{self.CJ_BUYSELL_HUB_MIN_HITS}）..."
+        )
         for step in range(max_pagedown):
             if not self.is_running:
                 return False
-            ok, score = self._cj_is_buy_sell_hub_confirmed()
+            ok, rep, hits, per_scores = self._cj_is_buy_sell_hub_confirmed()
             self.log(
-                f"[购买与出售] 步骤 {step + 1}: hub={score:.3f} "
-                f"(阈值 {self.CJ_BUYSELL_HUB_THRESHOLD}) | "
+                f"[购买与出售] 步骤 {step + 1}: 命中 {hits}/{len(self.CJ_BUYSELL_HUB_TEMPLATES)} "
+                f"rep={rep:.3f} | {self._cj_format_buysell_hub_scores(per_scores)} | "
                 f"{'已确认' if ok else '继续 PageDown'}"
             )
             if ok:
@@ -1475,13 +1510,16 @@ class FH_UltimateBot(ctk.CTk):
             self.hw_press("pagedown", delay=0.15)
             time.sleep(0.45)
 
-        ok, score = self._cj_is_buy_sell_hub_confirmed()
+        ok, rep, hits, per_scores = self._cj_is_buy_sell_hub_confirmed()
         self.log_image_detection_failure(
-            "购买与出售页(buysell_hub)",
-            [self.CJ_BUYSELL_HUB_TEMPLATE],
+            "购买与出售页(四特征图)",
+            list(self.CJ_BUYSELL_HUB_TEMPLATES),
             region=self.regions.get("全界面", self.regions["左"]),
-            threshold=self.CJ_BUYSELL_HUB_THRESHOLD,
-            extra=f"PageDown {max_pagedown} 次后仍未确认；末次 hub={score:.3f}",
+            threshold=self.CJ_BUYSELL_HUB_ITEM_THRESHOLD,
+            extra=(
+                f"PageDown {max_pagedown} 次后命中 {hits}/{len(self.CJ_BUYSELL_HUB_TEMPLATES)} "
+                f"(需≥{self.CJ_BUYSELL_HUB_MIN_HITS})；{self._cj_format_buysell_hub_scores(per_scores)}"
+            ),
         )
         return False
 
@@ -1518,14 +1556,16 @@ class FH_UltimateBot(ctk.CTk):
         best_id = "UNKNOWN"
         best_score = 0.0
 
-        hub_ok, hub_score = self._cj_is_buy_sell_hub_confirmed()
+        hub_ok, hub_score, hub_hits, hub_per = self._cj_is_buy_sell_hub_confirmed()
         tab_ok, tab_score = self._cj_is_vehicle_tab_confirmed()
         all_scores["BUY_SELL_HUB"] = {
             "score": hub_score,
-            "threshold": self.CJ_BUYSELL_HUB_THRESHOLD,
-            "label": "购买与出售(车展/拍卖场页)",
+            "threshold": self.CJ_BUYSELL_HUB_ITEM_THRESHOLD,
+            "label": "购买与出售(四特征≥2)",
             "probes": [],
             "hub_confirmed": hub_ok,
+            "hub_hits": hub_hits,
+            "hub_per_scores": hub_per,
         }
         all_scores["VEHICLE_TAB"] = {
             "score": tab_score,
@@ -1599,7 +1639,7 @@ class FH_UltimateBot(ctk.CTk):
                     self._cj_enter_my_cars_brand_list()
                 return False
             if current_id in self.CJ_IN_CAR_DEEP_PAGE_IDS:
-                hub_side, _ = self._cj_is_buy_sell_hub_confirmed()
+                hub_side, _, _, _ = self._cj_is_buy_sell_hub_confirmed()
                 tab_side, _ = self._cj_is_vehicle_tab_confirmed()
                 if hub_side or tab_side:
                     self.log(
@@ -4037,30 +4077,32 @@ class FH_UltimateBot(ctk.CTk):
         time.sleep(5)
 
 
-        self.log("等待嘉年华/住所界面（buysell_hub 或 车辆标签）...")
+        self.log("等待嘉年华/住所界面（购买与出售特征图或车辆标签）...")
         carnival_seen = False
         for _ in range(40):
             if not self.is_running:
                 return False
-            hub_score = self._cj_probe_buysell_hub_score()
+            hub_hits, hub_per, hub_rep = self._cj_probe_buysell_hub_hits()
             tab_score = self._cj_probe_vehicle_tab_score()
             if (
-                hub_score >= self.CJ_BUYSELL_HUB_THRESHOLD * 0.85
+                hub_hits >= 1
                 or tab_score >= self.CJ_VEHICLE_TAB_THRESHOLD * 0.85
             ):
                 carnival_seen = True
                 self.log(
-                    f"[嘉年华] 已见到界面 hub={hub_score:.3f} vehicle_tab={tab_score:.3f}"
+                    f"[嘉年华] 已见到界面 购买与出售命中={hub_hits}/4 rep={hub_rep:.3f} "
+                    f"| {self._cj_format_buysell_hub_scores(hub_per)} "
+                    f"vehicle_tab={tab_score:.3f}"
                 )
                 break
             time.sleep(0.5)
         if not carnival_seen:
             self.log_image_detection_failure(
                 "嘉年华/住所界面",
-                [self.CJ_BUYSELL_HUB_TEMPLATE, self.CJ_VEHICLE_TAB_TEMPLATE],
+                list(self.CJ_BUYSELL_HUB_TEMPLATES) + [self.CJ_VEHICLE_TAB_TEMPLATE],
                 region=self.regions.get("全界面", self.regions["左"]),
-                threshold=self.CJ_BUYSELL_HUB_THRESHOLD,
-                extra="进入 BNandUC 后 40 秒内未见 buysell_hub / UandT-w(左栏)",
+                threshold=self.CJ_BUYSELL_HUB_ITEM_THRESHOLD,
+                extra="进入 BNandUC 后 40 秒内未见购买与出售特征图(≥1) / UandT-w(左栏)",
             )
             return False
 
