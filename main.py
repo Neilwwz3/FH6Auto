@@ -89,7 +89,7 @@ LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
-CURRENT_VERSION = "1.1.6.3"
+CURRENT_VERSION = "1.1.6.4"
 def auto_extract_configs():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     
@@ -1397,21 +1397,117 @@ class FH_UltimateBot(ctk.CTk):
         {"id": "UPGRADE_TUNING", "label": "车辆详情-升级与调教", "templates": ["UandT-w.png", "UandT-b.png"], "region_key": "左下", "threshold": 0.70},
         {"id": "CAR_DETAIL", "label": "车辆详情", "templates": ["rc.png"], "region_key": "全界面", "threshold": 0.62},
         {"id": "MY_CARS_LIST", "label": "我的车辆-品牌列表", "templates": ["CCbrand.png"], "region_key": "全界面", "threshold": 0.75},
-        {"id": "BUY_SELL", "label": "购买与出售", "templates": ["buyandsell-w.png", "buyandsell-b.png"], "region_key": "左", "threshold": 0.75},
+        # buyandsell-w/b 由 _cj_probe_buyandsell_scores 单独判定，见 FESTIVAL_RESIDENCE / BUY_SELL_HUB
         {"id": "MENU_ESC", "label": "主菜单ESC页", "templates": ["collectionjournal.png"], "region_key": "左", "threshold": 0.70},
     ]
+    # buyandsell-w = 嘉年华/住所页，标签「购买与出售」未选中；buyandsell-b = 该标签已选中（确认在购买与出售页）
+    CJ_BUYSELL_B_THRESHOLD = 0.72
+    CJ_BUYSELL_W_THRESHOLD = 0.65
+    CJ_BUYSELL_B_OVER_W_MARGIN = 0.05
 
     def _cj_page_label(self, page_id):
+        extra_labels = {
+            "FESTIVAL_RESIDENCE": "嘉年华/住所(购买与出售未选中)",
+            "BUY_SELL_HUB": "购买与出售(已选中)",
+        }
+        if page_id in extra_labels:
+            return extra_labels[page_id]
         for p in self.CJ_PAGE_DEFS:
             if p["id"] == page_id:
                 return p["label"]
         return page_id or "未知"
+
+    def _cj_buyandsell_probe_regions(self):
+        """购买与出售标签可能出现的区域（不同模块历史配置不一致，取并集）。"""
+        seen = []
+        regions = []
+        for key in ("左", "上", "全界面"):
+            reg = self.regions.get(key)
+            if reg is not None and reg not in seen:
+                seen.append(reg)
+                regions.append((key, reg))
+        return regions
+
+    def _cj_probe_buyandsell_scores(self):
+        """返回 (w_score, b_score) 在多区域内的最高灰度匹配分。"""
+        w_best = 0.0
+        b_best = 0.0
+        for _key, region in self._cj_buyandsell_probe_regions():
+            for p in self.probe_gray_templates(["buyandsell-w.png"], region=region, fast_mode=True):
+                if not p.get("missing"):
+                    w_best = max(w_best, p["score"])
+            for p in self.probe_gray_templates(["buyandsell-b.png"], region=region, fast_mode=True):
+                if not p.get("missing"):
+                    b_best = max(b_best, p["score"])
+        return w_best, b_best
+
+    def _cj_is_buy_sell_hub_confirmed(self):
+        """
+        确认在购买与出售页：b 达标，且明显高于 w（选中态 vs 未选中态）。
+        返回 (confirmed, w_score, b_score)。
+        """
+        w_score, b_score = self._cj_probe_buyandsell_scores()
+        b_ok = b_score >= self.CJ_BUYSELL_B_THRESHOLD
+        if b_ok and b_score >= w_score + self.CJ_BUYSELL_B_OVER_W_MARGIN:
+            return True, w_score, b_score
+        if b_ok and w_score < self.CJ_BUYSELL_W_THRESHOLD:
+            return True, w_score, b_score
+        return False, w_score, b_score
+
+    def _cj_ensure_buy_sell_hub(self, max_pagedown=24):
+        """嘉年华/住所页：PageDown 直到 buyandsell-b 确认「购买与出售」已选中。"""
+        self.log("确认进入购买与出售页（PageDown 直至 buyandsell-b 选中）...")
+        for step in range(max_pagedown):
+            if not self.is_running:
+                return False
+            ok, w_score, b_score = self._cj_is_buy_sell_hub_confirmed()
+            self.log(
+                f"[购买与出售] 步骤 {step + 1}: w(未选中)={w_score:.3f} "
+                f"b(选中)={b_score:.3f} | {'已确认' if ok else '继续 PageDown'}"
+            )
+            if ok:
+                return True
+            self.hw_press("pagedown", delay=0.15)
+            time.sleep(0.45)
+
+        ok, w_score, b_score = self._cj_is_buy_sell_hub_confirmed()
+        self.log_image_detection_failure(
+            "购买与出售页确认(buyandsell-b)",
+            ["buyandsell-b.png", "buyandsell-w.png"],
+            region=self.regions.get("左", self.regions["全界面"]),
+            threshold=self.CJ_BUYSELL_B_THRESHOLD,
+            extra=f"PageDown {max_pagedown} 次后仍未确认；末次 w={w_score:.3f} b={b_score:.3f}",
+        )
+        return False
 
     def detect_current_page_cj(self, log_scores=False):
         """根据锚点模板判断超级抽奖相关界面；返回 (page_id, best_score, all_scores)。"""
         all_scores = {}
         best_id = "UNKNOWN"
         best_score = 0.0
+
+        hub_ok, w_tab, b_tab = self._cj_is_buy_sell_hub_confirmed()
+        all_scores["BUY_SELL_HUB"] = {
+            "score": b_tab,
+            "threshold": self.CJ_BUYSELL_B_THRESHOLD,
+            "label": "购买与出售(已选中)",
+            "probes": [],
+            "w_score": w_tab,
+            "hub_confirmed": hub_ok,
+        }
+        if hub_ok and b_tab > best_score:
+            best_score = b_tab
+            best_id = "BUY_SELL_HUB"
+        elif w_tab >= self.CJ_BUYSELL_W_THRESHOLD and not hub_ok and w_tab > best_score:
+            all_scores["FESTIVAL_RESIDENCE"] = {
+                "score": w_tab,
+                "threshold": self.CJ_BUYSELL_W_THRESHOLD,
+                "label": "嘉年华/住所(购买与出售未选中)",
+                "probes": [],
+                "b_score": b_tab,
+            }
+            best_score = w_tab
+            best_id = "FESTIVAL_RESIDENCE"
 
         for page_def in self.CJ_PAGE_DEFS:
             region = self.regions.get(page_def["region_key"], self.regions["全界面"])
@@ -1433,7 +1529,14 @@ class FH_UltimateBot(ctk.CTk):
                 best_id = page_def["id"]
 
         if log_scores:
-            parts = [f"{k}:{v['score']:.2f}" for k, v in all_scores.items()]
+            parts = []
+            for k, v in all_scores.items():
+                if k in ("BUY_SELL_HUB", "FESTIVAL_RESIDENCE"):
+                    extra = f" w={v.get('w_score', 0):.2f}" if "w_score" in v else ""
+                    extra += f" b={v.get('b_score', v.get('score', 0)):.2f}" if "b_score" in v or k == "BUY_SELL_HUB" else ""
+                    parts.append(f"{k}:{v['score']:.2f}{extra}")
+                else:
+                    parts.append(f"{k}:{v['score']:.2f}")
             self.log(f"[页面识别] 当前={best_id}({best_score:.2f}) | " + " ".join(parts))
 
         return best_id, best_score, all_scores
@@ -1452,8 +1555,12 @@ class FH_UltimateBot(ctk.CTk):
             return True
 
         if target_id == "MY_CARS_LIST":
-            if current_id == "BUY_SELL":
+            if current_id == "BUY_SELL_HUB":
                 self._cj_enter_my_cars_brand_list()
+                return False
+            if current_id == "FESTIVAL_RESIDENCE":
+                if self._cj_ensure_buy_sell_hub(max_pagedown=8):
+                    self._cj_enter_my_cars_brand_list()
                 return False
             if current_id in ("CAR_DETAIL", "UPGRADE_TUNING", "MASTERY_MENU", "MASTERY_SKILL"):
                 self.log(f"[页面导航] {self._cj_page_label(current_id)} → 按 ESC 退回")
@@ -1467,7 +1574,11 @@ class FH_UltimateBot(ctk.CTk):
             time.sleep(0.6)
             return False
 
-        if target_id == "BUY_SELL":
+        if target_id == "BUY_SELL_HUB":
+            if current_id == "FESTIVAL_RESIDENCE":
+                self.hw_press("pagedown", delay=0.15)
+                time.sleep(0.45)
+                return False
             if current_id in ("CAR_DETAIL", "UPGRADE_TUNING", "MASTERY_MENU", "MASTERY_SKILL", "MY_CARS_LIST"):
                 self.hw_press("esc")
                 time.sleep(0.7)
@@ -1541,7 +1652,7 @@ class FH_UltimateBot(ctk.CTk):
                 self.hw_press("esc")
                 time.sleep(0.6)
                 page_id, _, _ = self.detect_current_page_cj()
-                if page_id in ("CAR_DETAIL", "UPGRADE_TUNING", "BUY_SELL", "MY_CARS_LIST"):
+                if page_id in ("CAR_DETAIL", "UPGRADE_TUNING", "BUY_SELL_HUB", "FESTIVAL_RESIDENCE", "MY_CARS_LIST"):
                     break
 
         for attempt in range(8):
@@ -1562,7 +1673,7 @@ class FH_UltimateBot(ctk.CTk):
 
             cur, score, _ = self.detect_current_page_cj()
             self.log(f"[页面] 未找到升级与调教，当前={self._cj_page_label(cur)}({score:.2f})")
-            if cur == "MY_CARS_LIST" or cur == "BUY_SELL":
+            if cur in ("MY_CARS_LIST", "BUY_SELL_HUB", "FESTIVAL_RESIDENCE"):
                 break
             if cur == "MENU_ESC":
                 break
@@ -3875,20 +3986,30 @@ class FH_UltimateBot(ctk.CTk):
         time.sleep(5)
 
 
-        pos_bs = self.wait_for_any_image_gray(
-            ["buyandsell-w.png", "buyandsell-b.png"],
-            region=self.regions["左"],
-            threshold=0.75,
-            timeout=60,
-            interval=0.5,
-            fast_mode=True
-        )
-        if not pos_bs:
-            self.log("未找到购买与出售")
+        self.log("等待嘉年华/住所界面出现购买与出售标签...")
+        tab_seen = False
+        for _ in range(40):
+            if not self.is_running:
+                return False
+            w_score, b_score = self._cj_probe_buyandsell_scores()
+            if w_score >= self.CJ_BUYSELL_W_THRESHOLD or b_score >= self.CJ_BUYSELL_B_THRESHOLD:
+                tab_seen = True
+                self.log(f"[购买与出售] 已见到标签 w={w_score:.3f} b={b_score:.3f}")
+                break
+            time.sleep(0.5)
+        if not tab_seen:
+            self.log_image_detection_failure(
+                "嘉年华/住所-购买与出售标签",
+                ["buyandsell-w.png", "buyandsell-b.png"],
+                region=self.regions.get("左", self.regions["全界面"]),
+                threshold=self.CJ_BUYSELL_W_THRESHOLD,
+                extra="进入 BNandUC 后 40 秒内未见 w/b 标签",
+            )
             return False
 
-        self.game_click(pos_bs)
-        time.sleep(1.0)
+        if not self._cj_ensure_buy_sell_hub():
+            return False
+
         self.hw_press("pagedown", delay=0.15)
         self.log("进入车辆界面...")
         time.sleep(0.5)
@@ -3904,8 +4025,11 @@ class FH_UltimateBot(ctk.CTk):
             cur_page, cur_score, _ = self.detect_current_page_cj()
             if cur_page == "MY_CARS_LIST":
                 pass
-            elif cur_page == "BUY_SELL":
+            elif cur_page == "BUY_SELL_HUB":
                 self._cj_enter_my_cars_brand_list()
+            elif cur_page == "FESTIVAL_RESIDENCE":
+                if self._cj_ensure_buy_sell_hub(max_pagedown=12):
+                    self._cj_enter_my_cars_brand_list()
             else:
                 self.log(
                     f"[页面] 循环起点不在品牌列表（当前={self._cj_page_label(cur_page)} {cur_score:.2f}），尝试恢复"
@@ -3914,7 +4038,9 @@ class FH_UltimateBot(ctk.CTk):
                     self.log("超级抽奖：无法回到品牌列表检查点，正常结束本模块。")
                     return True
                 cur_page, _, _ = self.detect_current_page_cj()
-                if cur_page == "BUY_SELL":
+                if cur_page in ("BUY_SELL_HUB", "FESTIVAL_RESIDENCE"):
+                    if cur_page == "FESTIVAL_RESIDENCE":
+                        self._cj_ensure_buy_sell_hub(max_pagedown=12)
                     self._cj_enter_my_cars_brand_list()
 
             brand_pos = None
