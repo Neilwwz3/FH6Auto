@@ -89,7 +89,7 @@ LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
-CURRENT_VERSION = "1.1.6.12"
+CURRENT_VERSION = "1.1.6.15"
 def auto_extract_configs():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     
@@ -1635,8 +1635,15 @@ class FH_UltimateBot(ctk.CTk):
             return False
 
         if getattr(self, "_cj_subaru_brand_active", False):
-            self.log("斯巴鲁品牌已选中，跳过制造商 Up/重复点击")
-            return True
+            if not self.find_any_image_gray(
+                ["CCbrand.png"],
+                region=self.regions["全界面"],
+                threshold=0.75,
+                fast_mode=True,
+            ):
+                self.log("斯巴鲁品牌已选中，跳过制造商 Up/重复点击")
+                return True
+            self.log("[页面告警] 状态显示已选品牌，但仍在制造商列表，重新点击斯巴鲁")
 
         self.log("前往制造商：Up 拉至列表底部后选择斯巴鲁(CCbrand)...")
         time.sleep(0.4)
@@ -1682,13 +1689,13 @@ class FH_UltimateBot(ctk.CTk):
         self.log("已进入斯巴鲁品牌车辆列表")
         return True
 
-    def _cj_board_then_back_to_vehicle_tab(self):
+    def _cj_board_selected_car(self):
         """
-        选中目标车后（原作者逻辑）：
-        1) 识图 rc 点上车，否则 Enter 上车（不要先 Enter 再找 rc）
+        选中目标车后（尽量贴合 1.1.6.1）：
+        1) 识图 rc 点上车，否则双 Enter 上车
         2) 等待加载
-        3) ESC 退回嘉年华；不把车辆标签识别当硬前置，后续仍按原逻辑找 UandT
-        返回 boarded_via_rc 供日志使用。
+        3) 不强制导航页面，后续继续原逻辑找升级与调教
+        返回 boarded_via_rc 供日志使用；仅在停止时返回 None。
         """
         if not self.is_running:
             return None
@@ -1711,23 +1718,24 @@ class FH_UltimateBot(ctk.CTk):
             self.game_click(pos_rc)
             boarded_via_rc = True
         else:
-            self.log("回车上车（Enter）")
+            self.log("回车上车（双 Enter）")
+            self.hw_press("enter")
+            time.sleep(1.0)
             self.hw_press("enter")
             time.sleep(1.0)
 
         self.log("等待上车加载...")
         time.sleep(4.0)
 
-        self.log("ESC 退回嘉年华...")
-        self.hw_press("esc")
-        time.sleep(1.0)
-        self.hw_press("esc")
-        time.sleep(0.8)
-
-        if self._cj_is_vehicle_tab_confirmed()[0]:
-            self.log("已在「车辆」标签")
-        else:
-            self.log("[页面告警] 上车并 ESC 后未确认车辆标签，继续按原逻辑寻找升级与调教")
+        # 仅告警，不改变主流程按键
+        pos_ut_hint = self.find_any_image_gray(
+            ["UandT-w.png", "UandT-b.png"],
+            region=self.regions["左下"],
+            threshold=0.70,
+            fast_mode=True,
+        )
+        if not pos_ut_hint:
+            self.log("[页面告警] 上车后未立即看到升级与调教，后续将按原逻辑 ESC 搜索")
 
         return boarded_via_rc
 
@@ -1844,11 +1852,9 @@ class FH_UltimateBot(ctk.CTk):
             return False
 
         for attempt in range(1, max_rounds + 1):
-            self.log(f"[页面恢复] 第 {attempt}/{max_rounds} 轮：{label}（进入我的车辆 + 选斯巴鲁）")
+            self.log(f"[页面恢复] 第 {attempt}/{max_rounds} 轮：{label}（进入我的车辆）")
             self._cj_enter_my_cars_brand_list()
-            if self._cj_select_subaru_brand():
-                return True
-            time.sleep(0.5)
+            return True
 
         self.log(f"[页面恢复] 未能回到 {label}")
         return False
@@ -4220,23 +4226,23 @@ class FH_UltimateBot(ctk.CTk):
             return False
         if not self._cj_ensure_vehicle_tab():
             return False
-        self._cj_enter_my_cars_brand_list()
-        if not self._cj_select_subaru_brand():
-            self._cj_enter_my_cars_brand_list()
-            if not self._cj_select_subaru_brand():
-                return False
 
         while self.cj_counter < target_count:
             if not self.is_running:
                 return False
 
-            if not self._cj_subaru_brand_active:
+            # 保持与 1.1.6.1 一致：每轮都进入“我的车辆”再选品牌
+            self._cj_enter_my_cars_brand_list()
+            if not self._cj_select_subaru_brand():
+                self.log("选品牌未命中，重试一次进入我的车辆后再选斯巴鲁...")
+                self._cj_enter_my_cars_brand_list()
                 if not self._cj_select_subaru_brand():
-                    self.log("选品牌未命中，重新进入我的车辆后再选斯巴鲁...")
-                    self._cj_enter_my_cars_brand_list()
-                    if not self._cj_select_subaru_brand():
-                        self.log("超级抽奖：选品牌失败，正常结束本模块。")
+                    cj_flow_fail_streak += 1
+                    if cj_flow_fail_streak >= 3:
+                        self.log("超级抽奖：连续 3 次选品牌失败，正常结束本模块。")
                         return True
+                    continue
+            cj_flow_fail_streak = 0
 
             jump_pages = max(0, self.memory_car_page - 1)
             
@@ -4297,7 +4303,7 @@ class FH_UltimateBot(ctk.CTk):
                 )
                 self.memory_car_page = 0
                 return True
-            boarded_via_rc = self._cj_board_then_back_to_vehicle_tab()
+            boarded_via_rc = self._cj_board_selected_car()
             if boarded_via_rc is None:
                 for _ in range(3):
                     if not self.is_running:
@@ -4406,15 +4412,15 @@ class FH_UltimateBot(ctk.CTk):
                 self.cj_counter += 1
                 self.update_running_ui("超级抽奖", self.cj_counter, target_count)
 
-            self.log("本轮完成，退出车辆详情返回列表...")
-            for _ in range(3):
+            self.log("本轮完成，返回我的车辆列表...")
+            for _ in range(2):
                 if not self.is_running:
                     return False
                 self.hw_press("esc")
-                time.sleep(0.8)
+                time.sleep(1.2 if _ == 0 else 0.8)
             self.hw_press("up", delay=0.15)
-            time.sleep(0.5)
-            self._cj_subaru_brand_active = True
+            time.sleep(0.8)
+            self._cj_subaru_brand_active = False
         self.hw_press("esc")
         time.sleep(1.2)
         self.hw_press("esc")
