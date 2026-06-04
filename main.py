@@ -89,7 +89,7 @@ LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
-CURRENT_VERSION = "1.1.6.15"
+CURRENT_VERSION = "1.1.6.16"
 def auto_extract_configs():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     
@@ -4657,32 +4657,43 @@ class FH_UltimateBot(ctk.CTk):
         time.sleep(1.0)
 
 
-        #切换到消耗品品牌
+        # 切换到消耗品品牌（斯巴鲁在列表底部，需先 PageUp 再向上搜）
         self.log("切换到消耗品品牌...")
         self.hw_press("backspace")
+        time.sleep(0.5)
+        self.hw_press("pagedown", delay=0.15)
+        time.sleep(0.4)
+        self.hw_press("up", delay=0.12)
+        time.sleep(0.45)
+
         brand_pos = None
-        for _ in range(5):
+        for _ in range(30):
             if not self.is_running:
                 return False
-                
-
             brand_pos = self.wait_for_any_image_gray(
                 ["CCbrand.png"],
                 region=self.regions["全界面"],
-                threshold=0.75,
-                timeout=0.8,
+                threshold=0.72,
+                timeout=1.0,
                 interval=0.2,
-                fast_mode=True
+                fast_mode=True,
             )
             if brand_pos:
+                self.log(f"找到斯巴鲁品牌（Up 后第 {_ + 1} 次识图）")
                 break
-
-            self.hw_press("up")
-            time.sleep(0.25)
+            self.hw_press("up", delay=0.12)
+            time.sleep(0.22)
 
         if not brand_pos:
-            self.log("未找到品牌")
-            return False
+            self.log_image_detection_failure(
+                "移除车-斯巴鲁品牌(CCbrand)",
+                ["CCbrand.png"],
+                region=self.regions["全界面"],
+                threshold=0.72,
+                extra="已 PageDown+Up 搜索仍未命中；请人工确认是否在消耗品品牌页",
+            )
+            self.log("未找到斯巴鲁品牌，结束本轮移除流程（不触发全局恢复）。")
+            return True
 
         self.game_click(brand_pos)
         time.sleep(0.8)
