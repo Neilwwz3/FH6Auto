@@ -89,7 +89,7 @@ LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
-CURRENT_VERSION = "1.1.6.16"
+CURRENT_VERSION = "1.1.6.22"
 def auto_extract_configs():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     
@@ -1391,9 +1391,12 @@ class FH_UltimateBot(ctk.CTk):
                     )
 
     # --- 超级抽奖：页面定义（优先级高的先匹配 = 更具体的子界面）---
+    # PageDef：仅用于超级抽奖「步骤失败」后的检查点恢复（见 cj_recover_to_checkpoint），
+    # 禁止接入 logic_super_wheelspin 等正常主流程。
     CJ_PAGE_DEFS = [
         {"id": "MASTERY_SKILL", "label": "熟练度加点页", "templates": ["EXPwU.png"], "region_key": "左", "threshold": 0.75},
-        {"id": "MASTERY_MENU", "label": "升级菜单(含熟练度项)", "templates": ["clsldcnw.png", "clsldcnb.png"], "region_key": "左下", "threshold": 0.68},
+        # 「升级与调教」子列表内：可见/选中「车辆熟练度」行（Down×10 至最底后用于 PageDef 校验）
+        {"id": "MASTERY_MENU", "label": "升级与调教子菜单-车辆熟练度", "templates": ["clsldcnw.png", "clsldcnb.png"], "region_key": "左下", "threshold": 0.68},
         # 车内「升级与调教」菜单项用 UandT-b；UandT-w 仅用于嘉年华左侧「车辆」标签（见 VEHICLE_TAB）
         {"id": "UPGRADE_TUNING", "label": "车辆详情-升级与调教", "templates": ["UandT-b.png"], "region_key": "左下", "threshold": 0.70},
         # 不用 rc.png 做页面锚点（与「上车」按钮同图，易误判）；车辆详情靠 UandT-b / 熟练度模板
@@ -1416,6 +1419,7 @@ class FH_UltimateBot(ctk.CTk):
         {"UPGRADE_TUNING", "MASTERY_MENU", "MASTERY_SKILL", "CAR_DETAIL"}
     )
     CJ_CARNIVAL_SUPPRESS_MARGIN = 0.12
+    CJ_UPGRADE_SUBMENU_DOWN_STEPS = 10  # 升级与调教子菜单：左上角起连按 Down 至最底「车辆熟练度」
 
     def _cj_page_label(self, page_id):
         extra_labels = {
@@ -1491,7 +1495,7 @@ class FH_UltimateBot(ctk.CTk):
         return score >= self.CJ_VEHICLE_TAB_THRESHOLD, score
 
     def _cj_ensure_buy_sell_hub(self, max_pagedown=24):
-        """嘉年华/住所：PageDown 直到购买与出售四特征图命中 ≥2。"""
+        """【仅恢复路径】嘉年华/住所：PageDown 直到购买与出售四特征图命中 ≥2。"""
         self.log(
             f"确认进入购买与出售页（{len(self.CJ_BUYSELL_HUB_TEMPLATES)} 图命中"
             f"≥{self.CJ_BUYSELL_HUB_MIN_HITS}）..."
@@ -1524,7 +1528,7 @@ class FH_UltimateBot(ctk.CTk):
         return False
 
     def _cj_ensure_vehicle_tab(self, max_pagedown=12):
-        """从购买与出售页 PageDown 直到左侧「车辆」标签 (UandT-w) 命中。"""
+        """【仅恢复路径】从购买与出售页 PageDown 直到左侧「车辆」标签 (UandT-w) 命中。"""
         self.log("确认进入车辆标签（识图 UandT-w @ 左侧栏）...")
         for step in range(max_pagedown):
             if not self.is_running:
@@ -1724,18 +1728,36 @@ class FH_UltimateBot(ctk.CTk):
             self.hw_press("enter")
             time.sleep(1.0)
 
-        self.log("等待上车加载...")
-        time.sleep(4.0)
+        self.log("等待上车加载（5秒）...")
+        time.sleep(5.0)
 
-        # 仅告警，不改变主流程按键
-        pos_ut_hint = self.find_any_image_gray(
-            ["UandT-w.png", "UandT-b.png"],
-            region=self.regions["左下"],
-            threshold=0.70,
-            fast_mode=True,
-        )
-        if not pos_ut_hint:
-            self.log("[页面告警] 上车后未立即看到升级与调教，后续将按原逻辑 ESC 搜索")
+        # 退出驾驶/加载界面后，按 ESC 直到出现「升级与调教」入口（原流程依赖此步）
+        ut_threshold = 0.70
+        pos_ut = None
+        for esc_i in range(10):
+            if not self.is_running:
+                return None
+            pos_ut = self.find_any_image_gray(
+                ["UandT-w.png", "UandT-b.png"],
+                region=self.regions["左下"],
+                threshold=ut_threshold,
+                fast_mode=True,
+            )
+            if not pos_ut:
+                pos_ut = self.find_any_image_gray(
+                    ["UandT-w.png", "UandT-b.png"],
+                    region=self.regions["全界面"],
+                    threshold=ut_threshold,
+                    fast_mode=True,
+                )
+            if pos_ut:
+                self.log(f"上车后第 {esc_i + 1} 次 ESC 后识别到升级与调教入口")
+                break
+            self.hw_press("esc")
+            time.sleep(0.6)
+
+        if not pos_ut:
+            self.log("[页面告警] 多次 ESC 后仍未识别到升级与调教，继续尝试 ESC 搜索")
 
         return boarded_via_rc
 
@@ -1801,7 +1823,7 @@ class FH_UltimateBot(ctk.CTk):
         return False
 
     def navigate_to_cj_page(self, target_id, max_steps=14):
-        """识图驱动：从当前界面逐步导航到目标页面。"""
+        """【仅恢复路径】识图驱动：从当前界面逐步导航到目标页面。"""
         target_label = self._cj_page_label(target_id)
         for step in range(max_steps):
             if not self.is_running:
@@ -1840,10 +1862,28 @@ class FH_UltimateBot(ctk.CTk):
             f"{self._cj_page_label(page_id)}({score:.2f})"
         )
 
+    def _cj_on_super_wheelspin_failure(self, step_label, fail_streak):
+        """
+        仅超级抽奖失败路径：PageDef 诊断当前页 + 导航回 MY_CARS_LIST 检查点。
+        不改动正常主流程按键序列。
+        """
+        page_id, score, _ = self.detect_current_page_cj(log_scores=True)
+        self.log(
+            f"[超级抽奖-步骤失败] {step_label} | 当前页面={self._cj_page_label(page_id)}({score:.2f})"
+        )
+        self.cj_recover_to_checkpoint("MY_CARS_LIST", max_rounds=2)
+        fail_streak += 1
+        if fail_streak >= 3:
+            self.log(
+                f"超级抽奖：连续 3 次「{step_label}」失败，正常结束本模块（不触发全局恢复）。"
+            )
+            return None
+        return fail_streak
+
     def cj_recover_to_checkpoint(self, checkpoint_id="MY_CARS_LIST", max_rounds=2):
         """
-        出错后的复原：用固定按键路径回到检查点，不用 PageDef 逐步导航（未标定会误判）。
-        识别不到目标界面则直接返回 False，不盲按 ESC。
+        出错后专用：PageDef 识图判断位置，再导航/原键序回到检查点。
+        禁止在正常主流程中调用。
         """
         self._cj_subaru_brand_active = False
         label = self._cj_page_label(checkpoint_id)
@@ -1852,9 +1892,29 @@ class FH_UltimateBot(ctk.CTk):
             return False
 
         for attempt in range(1, max_rounds + 1):
-            self.log(f"[页面恢复] 第 {attempt}/{max_rounds} 轮：{label}（进入我的车辆）")
-            self._cj_enter_my_cars_brand_list()
-            return True
+            self.log(f"[页面恢复] 第 {attempt}/{max_rounds} 轮 → {label}")
+            cur_id, cur_score, _ = self.detect_current_page_cj(log_scores=(attempt == 1))
+            if cur_id in ("MASTERY_SKILL", "MASTERY_MENU", "UPGRADE_TUNING"):
+                self.log(
+                    f"[页面恢复] 当前在 {self._cj_page_label(cur_id)}，"
+                    f"先 ESC 退出（避免停在升级预设/熟练度子页）"
+                )
+                for _ in range(5):
+                    if not self.is_running:
+                        return False
+                    self.hw_press("esc")
+                    time.sleep(0.55)
+            if cur_id == checkpoint_id:
+                self.log(f"[页面恢复] 已在检查点 {label}({cur_score:.2f})")
+                return True
+            if self.navigate_to_cj_page(checkpoint_id, max_steps=14):
+                return True
+            tab_ok, _ = self._cj_is_vehicle_tab_confirmed()
+            hub_ok, _, _, _ = self._cj_is_buy_sell_hub_confirmed()
+            if tab_ok or hub_ok:
+                self.log("[页面恢复] 嘉年华界面已确认，按原键序进入我的车辆")
+                self._cj_enter_my_cars_brand_list()
+                return True
 
         self.log(f"[页面恢复] 未能回到 {label}")
         return False
@@ -1894,39 +1954,88 @@ class FH_UltimateBot(ctk.CTk):
             )
         return pos_sjy
 
-    def _try_enter_cj_mastery_menu(self):
-        """进入「车辆熟练度」；含方向键导航与全界面兜底。"""
-        templates = ["clsldcnw.png", "clsldcnb.png"]
-        threshold = 0.68
-        search_plan = [
-            ("左下", self.regions["左下"], 8),
-            ("全界面", self.regions["全界面"], 5),
-        ]
-        for nav_try in range(4):
-            if nav_try > 0:
-                self.log(f"车辆熟练度：导航重试 {nav_try}/3（按 down）")
-                self.hw_press("down", delay=0.12)
-                time.sleep(0.35)
-            for reg_name, reg, timeout_sec in search_plan:
-                pos = self.wait_for_any_image_gray(
-                    templates,
-                    region=reg,
-                    threshold=threshold,
-                    timeout=timeout_sec,
-                    interval=0.25,
-                    fast_mode=True,
-                )
-                if pos:
-                    self.log(f"车辆熟练度：在「{reg_name}」识别成功")
-                    return pos
+    def _cj_enter_mastery_from_upgrade_submenu(self):
+        """
+        上一步已确认进入「升级与调教」子列表后：
+        鼠标移到游戏内左上角 → Down×10（最底项为车辆熟练度）→ PageDef(MASTERY_MENU) 校验 → Enter。
+        """
+        if not self.is_running:
+            return False
+
+        mastery_row_templates = ["clsldcnw.png", "clsldcnb.png"]
+        submenu_page_id = "MASTERY_MENU"
+
+        if self.find_any_image(
+            ["EXPwU.png"],
+            region=self.regions["左"],
+            threshold=0.75,
+            fast_mode=True,
+        ):
+            self.log("已在车辆熟练度加点页，跳过子菜单选择")
+            return True
+
+        steps = self.CJ_UPGRADE_SUBMENU_DOWN_STEPS
+        self.log(f"子菜单：光标置左上角后 Down×{steps} 定位车辆熟练度（最底项）...")
+        self.move_to_game_coord(5, 5)
+        time.sleep(0.25)
+        for i in range(steps):
+            if not self.is_running:
+                return False
+            self.hw_press("down", delay=0.12)
+            time.sleep(0.28)
+
+        page_id, page_score, _ = self.detect_current_page_cj(log_scores=True)
+        if page_id == submenu_page_id:
+            self.log(
+                f"PageDef 确认：升级与调教子菜单 / 车辆熟练度项 "
+                f"({self._cj_page_label(submenu_page_id)} {page_score:.2f})"
+            )
+        else:
+            probes = self.probe_gray_templates(
+                mastery_row_templates,
+                region=self.regions["左下"],
+                fast_mode=True,
+            )
+            row_best = max(
+                (p["score"] for p in probes if not p.get("missing")), default=0.0
+            )
+            self.log_image_detection_failure(
+                "升级与调教子菜单-车辆熟练度(PageDef)",
+                mastery_row_templates,
+                region=self.regions["左下"],
+                threshold=0.68,
+                extra=(
+                    f"Down×{steps} 后期望 {submenu_page_id}，"
+                    f"当前={self._cj_page_label(page_id)}({page_score:.2f})；"
+                    f"clsldcn 探测={row_best:.3f}"
+                ),
+            )
+            return False
+
+        self.log("Enter 进入车辆熟练度...")
+        self.hw_press("enter")
+        time.sleep(1.5)
+
+        if self.find_any_image(
+            ["EXPwU.png"],
+            region=self.regions["左"],
+            threshold=0.72,
+            fast_mode=True,
+        ):
+            return True
+        skill_page, skill_score, _ = self.detect_current_page_cj(log_scores=False)
+        if skill_page == "MASTERY_SKILL":
+            self.log(f"PageDef 确认：熟练度加点页 ({skill_score:.2f})")
+            return True
+
         self.log_image_detection_failure(
-            "车辆熟练度入口",
-            templates,
-            region=self.regions["左下"],
-            threshold=threshold,
-            extra="已点击升级与调教；已尝试 down 导航 + 全界面兜底",
+            "车辆熟练度加点页",
+            ["EXPwU.png"],
+            region=self.regions["左"],
+            threshold=0.72,
+            extra="Enter 后未见 EXPwU / MASTERY_SKILL",
         )
-        return None
+        return False
 
     def start_pipeline(self, start_step):
         if self.is_running:
@@ -4162,11 +4271,10 @@ class FH_UltimateBot(ctk.CTk):
             return True
 
         self.update_running_ui("超级抽奖", self.cj_counter, target_count)
-        # 【新增】：初始化记忆页码
-        if not hasattr(self, 'memory_car_page'):
+        if not hasattr(self, "memory_car_page"):
             self.memory_car_page = 0
-        self._cj_subaru_brand_active = False
         cj_flow_fail_streak = 0
+
         self.log("准备验证/进入菜单...")
         if not self.enter_menu():
             return False
@@ -4181,7 +4289,7 @@ class FH_UltimateBot(ctk.CTk):
             threshold=0.70,
             timeout=15,
             interval=0.3,
-            fast_mode=True
+            fast_mode=True,
         )
         if not pos_buycar:
             self.log("未识别到 购买新车与二手车")
@@ -4192,73 +4300,91 @@ class FH_UltimateBot(ctk.CTk):
         self.hw_press("enter")
         time.sleep(5)
 
-
-        self.log("等待嘉年华/住所界面（购买与出售特征图或车辆标签）...")
-        carnival_seen = False
-        for _ in range(40):
-            if not self.is_running:
-                return False
-            hub_hits, hub_per, hub_rep = self._cj_probe_buysell_hub_hits()
-            tab_score = self._cj_probe_vehicle_tab_score()
-            if (
-                hub_hits >= 1
-                or tab_score >= self.CJ_VEHICLE_TAB_THRESHOLD * 0.85
-            ):
-                carnival_seen = True
-                self.log(
-                    f"[嘉年华] 已见到界面 购买与出售命中={hub_hits}/4 rep={hub_rep:.3f} "
-                    f"| {self._cj_format_buysell_hub_scores(hub_per)} "
-                    f"vehicle_tab={tab_score:.3f}"
-                )
-                break
-            time.sleep(0.5)
-        if not carnival_seen:
+        pos_bs = self.wait_for_any_image_gray(
+            ["buyandsell-w.png", "buyandsell-b.png"],
+            region=self.regions["上"],
+            threshold=0.75,
+            timeout=60,
+            interval=0.5,
+            fast_mode=True,
+        )
+        if not pos_bs:
+            self.log("未找到购买与出售")
             self.log_image_detection_failure(
-                "嘉年华/住所界面",
-                list(self.CJ_BUYSELL_HUB_TEMPLATES) + [self.CJ_VEHICLE_TAB_TEMPLATE],
-                region=self.regions.get("全界面", self.regions["左"]),
-                threshold=self.CJ_BUYSELL_HUB_ITEM_THRESHOLD,
-                extra="进入 BNandUC 后 40 秒内未见购买与出售特征图(≥1) / UandT-w(左栏)",
+                "购买与出售入口",
+                ["buyandsell-w.png", "buyandsell-b.png"],
+                region=self.regions["上"],
+                threshold=0.75,
             )
             return False
 
-        if not self._cj_ensure_buy_sell_hub():
-            return False
-        if not self._cj_ensure_vehicle_tab():
-            return False
+        self.game_click(pos_bs)
+        time.sleep(1.0)
+        self.hw_press("pagedown", delay=0.15)
+        self.log("进入车辆界面...")
+        time.sleep(0.5)
 
         while self.cj_counter < target_count:
             if not self.is_running:
                 return False
 
-            # 保持与 1.1.6.1 一致：每轮都进入“我的车辆”再选品牌
-            self._cj_enter_my_cars_brand_list()
-            if not self._cj_select_subaru_brand():
-                self.log("选品牌未命中，重试一次进入我的车辆后再选斯巴鲁...")
-                self._cj_enter_my_cars_brand_list()
-                if not self._cj_select_subaru_brand():
-                    cj_flow_fail_streak += 1
-                    if cj_flow_fail_streak >= 3:
-                        self.log("超级抽奖：连续 3 次选品牌失败，正常结束本模块。")
-                        return True
-                    continue
+            self.log("进入我的车辆.")
+            self.hw_press("enter")
+            time.sleep(2.0)
+            self.hw_press("backspace")
+            time.sleep(1.0)
+
+            brand_pos = None
+            for _ in range(30):
+                if not self.is_running:
+                    return False
+                brand_pos = self.wait_for_any_image_gray(
+                    ["CCbrand.png"],
+                    region=self.regions["全界面"],
+                    threshold=0.75,
+                    timeout=0.8,
+                    interval=0.2,
+                    fast_mode=True,
+                )
+                if brand_pos:
+                    break
+                self.hw_press("up")
+                time.sleep(0.25)
+
+            if not brand_pos:
+                self.log_image_detection_failure(
+                    "选择斯巴鲁品牌",
+                    ["CCbrand.png"],
+                    region=self.regions["全界面"],
+                    threshold=0.75,
+                )
+                cj_flow_fail_streak = self._cj_on_super_wheelspin_failure(
+                    "选择斯巴鲁品牌", cj_flow_fail_streak
+                )
+                if cj_flow_fail_streak is None:
+                    return True
+                continue
+
+            self.game_click(brand_pos)
+            time.sleep(1.0)
             cj_flow_fail_streak = 0
 
             jump_pages = max(0, self.memory_car_page - 1)
-            
+
             if jump_pages > 0:
                 self.log(f"智能记忆触发：快速跳过前 {jump_pages} 页...")
                 for _ in range(jump_pages):
-                    if not self.is_running: return False
+                    if not self.is_running:
+                        return False
                     for _ in range(4):
                         self.hw_press("right", delay=0.06)
                         time.sleep(0.1)
-                    time.sleep(0.15) # 给一点点动画缓冲时间
+                    time.sleep(0.15)
+
             found_car = False
-            current_page = jump_pages # 记录当前所在的真实页码
+            current_page = jump_pages
             pages_scanned = 0
-            
-            # 最大翻页次数扣除已经跳过的页数
+
             for _ in range(85 - jump_pages):
                 if not self.is_running:
                     return False
@@ -4266,33 +4392,30 @@ class FH_UltimateBot(ctk.CTk):
                     "newCC.png",
                     "newcartag.png",
                     region=self.regions["全界面"],
-                    main_threshold=0.75,   # 防HDR核心：第一道门槛放低
+                    main_threshold=0.75,
                     like_threshold=0.75,
                     final_threshold=0.70,
                     timeout=1.5,
                     interval=0.2,
-                    fast_mode=True
+                    fast_mode=True,
                 )
-                
                 if pos_target:
                     self.game_click(pos_target)
                     found_car = True
-                    # 记住这次找到车是在哪一页
-                    self.memory_car_page = current_page 
+                    self.memory_car_page = current_page
                     self.log(f"锁定目标车辆！已记录当前页码: {current_page}")
                     break
-                    
-                # 翻下一页
                 for _ in range(4):
                     self.hw_press("right", delay=0.06)
                     time.sleep(0.1)
                 time.sleep(0.4)
                 current_page += 1
                 pages_scanned += 1
+
             if not found_car:
                 self.log(
-                    f"列表中未找到目标车辆（已扫描约 {pages_scanned} 页，"
-                    f"记忆页码 {self.memory_car_page}→0）。视为无可购目标车，正常结束超级抽奖。"
+                    f"列表中未找到目标车辆（已扫描约 {pages_scanned} 页）。"
+                    f"视为无可购目标车，正常结束超级抽奖。"
                 )
                 self.log_image_detection_failure(
                     "列表扫描-目标车辆(newCC+全新标签)",
@@ -4303,87 +4426,96 @@ class FH_UltimateBot(ctk.CTk):
                 )
                 self.memory_car_page = 0
                 return True
-            boarded_via_rc = self._cj_board_selected_car()
-            if boarded_via_rc is None:
-                for _ in range(3):
-                    if not self.is_running:
-                        return False
-                    self.hw_press("esc")
-                    time.sleep(0.6)
-                cj_flow_fail_streak += 1
-                if cj_flow_fail_streak >= 3:
-                    self.log("超级抽奖：连续 3 次上车/回车辆标签失败，正常结束本模块。")
-                    return True
-                continue
 
-            pos_sjy = self.find_any_image_gray(
-                ["UandT-w.png", "UandT-b.png"],
-                region=self.regions["左下"],
+            time.sleep(1.2)
+            self.log("尝试寻找'上车'按钮...")
+
+            pos_rc = self.wait_for_image_gray(
+                "rc.png",
+                region=self.regions["全界面"],
                 threshold=0.70,
+                timeout=0.5,
+                interval=0.1,
+                fast_mode=True,
             )
-            if not pos_sjy:
+            if pos_rc:
+                self.log("点击上车")
+                self.game_click(pos_rc)
+                time.sleep(2.0)
+            else:
+                self.log("回车上车")
+                self.hw_press("enter")
+                time.sleep(1.0)
+                self.hw_press("enter")
+                time.sleep(1.0)
+
+            pos_sjy = None
+            for _ in range(20):
+                if not self.is_running:
+                    return False
                 pos_sjy = self.find_any_image_gray(
                     ["UandT-w.png", "UandT-b.png"],
-                    region=self.regions["全界面"],
+                    region=self.regions["左下"],
                     threshold=0.70,
                 )
+                if pos_sjy:
+                    break
+                self.hw_press("esc")
+                time.sleep(0.5)
+
             if not pos_sjy:
-                pos_sjy = self._cj_find_upgrade_tuning_entry(boarded_via_rc)
-            if not pos_sjy:
-                self._cj_warn_if_unexpected_page(
-                    "升级与调教",
-                    ("BUY_SELL_HUB", "VEHICLE_TAB", "MY_CARS_LIST", "MENU_ESC"),
+                self.log_image_detection_failure(
+                    "升级与调教入口",
+                    ["UandT-w.png", "UandT-b.png"],
+                    region=self.regions["左下"],
+                    threshold=0.70,
                 )
-                for _ in range(3):
-                    if not self.is_running:
-                        return False
-                    self.hw_press("esc")
-                    time.sleep(0.6)
-                cj_flow_fail_streak += 1
-                if cj_flow_fail_streak >= 3:
-                    self.log("超级抽奖：连续 3 次无法进入升级与调教，正常结束本模块。")
+                cj_flow_fail_streak = self._cj_on_super_wheelspin_failure(
+                    "升级与调教", cj_flow_fail_streak
+                )
+                if cj_flow_fail_streak is None:
                     return True
                 continue
 
-            cj_flow_fail_streak = 0
+            self.log("确认进入升级与调教（点击 + Enter）...")
             self.game_click(pos_sjy)
-            time.sleep(1.2)
+            time.sleep(0.25)
+            self.hw_press("enter")
+            time.sleep(1.0)
 
-            pos_cls = self._try_enter_cj_mastery_menu()
-            if not pos_cls:
-                self._cj_warn_if_unexpected_page(
-                    "车辆熟练度",
-                    ("BUY_SELL_HUB", "VEHICLE_TAB", "MY_CARS_LIST", "MENU_ESC"),
+            if not self._cj_enter_mastery_from_upgrade_submenu():
+                cj_flow_fail_streak = self._cj_on_super_wheelspin_failure(
+                    "车辆熟练度", cj_flow_fail_streak
                 )
-                for _ in range(3):
-                    if not self.is_running:
-                        return False
-                    self.hw_press("esc")
-                    time.sleep(0.6)
-                cj_flow_fail_streak += 1
-                if cj_flow_fail_streak >= 3:
-                    self.log("超级抽奖：连续 3 次无法进入车辆熟练度，正常结束本模块。")
+                if cj_flow_fail_streak is None:
                     return True
                 continue
 
             cj_flow_fail_streak = 0
 
-            self.game_click(pos_cls)
-            time.sleep(1.5)
-
-            pos_exp = self.wait_for_any_image(
+            # 必须先判断是否已加点，再 Enter；熟练度项上的 Enter 会误触第一个技能点
+            self.log("检测是否已加点（EXPwU）...")
+            pos_exp = self.find_any_image(
                 ["EXPwU.png"],
                 region=self.regions["左"],
                 threshold=0.75,
-                timeout=1.5,
-                interval=0.3,
-                fast_mode=True
+                fast_mode=True,
             )
+            if not pos_exp:
+                pos_exp = self.wait_for_any_image(
+                    ["EXPwU.png"],
+                    region=self.regions["左"],
+                    threshold=0.75,
+                    timeout=1.0,
+                    interval=0.25,
+                    fast_mode=True,
+                )
 
             if pos_exp:
-                self.log("该车辆技能已点过，跳过计数")
+                self.log("该车辆技能已点过（EXPwU 已出现），跳过计数")
             else:
-                time.sleep(1.0)
+                self.log("未检测到已加点标记，开始按配置路线加点...")
+                time.sleep(0.5)
                 self.hw_press("enter")
                 time.sleep(1.5)
 
@@ -4395,8 +4527,9 @@ class FH_UltimateBot(ctk.CTk):
                     self.hw_press("enter")
                     time.sleep(1.2)
 
-                spne_found = self.find_image_gray("SPNE.png", region=self.regions["全界面"], threshold=0.70)
-                
+                spne_found = self.find_image_gray(
+                    "SPNE.png", region=self.regions["全界面"], threshold=0.70
+                )
                 if spne_found:
                     self.log("已无技能点或技能已点完，提前结束抽奖！")
                     time.sleep(1.0)
@@ -4412,15 +4545,13 @@ class FH_UltimateBot(ctk.CTk):
                 self.cj_counter += 1
                 self.update_running_ui("超级抽奖", self.cj_counter, target_count)
 
-            self.log("本轮完成，返回我的车辆列表...")
-            for _ in range(2):
-                if not self.is_running:
-                    return False
-                self.hw_press("esc")
-                time.sleep(1.2 if _ == 0 else 0.8)
+            self.hw_press("esc")
+            time.sleep(1.2)
+            self.hw_press("esc")
+            time.sleep(0.8)
             self.hw_press("up", delay=0.15)
             time.sleep(0.8)
-            self._cj_subaru_brand_active = False
+
         self.hw_press("esc")
         time.sleep(1.2)
         self.hw_press("esc")
